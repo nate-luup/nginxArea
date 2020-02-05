@@ -1,0 +1,289 @@
+{%- set grains_bucket_region = salt['grains.get']('s3shared_region', salt['grains.get']('region')) %}
+{%- set templates_vars = vars.get('templates', {}) %}
+{%- set portal_vars = templates_vars.get('/opt/portal/conf/portal.properties', {}) %}
+{%- set pillar_vars = portal_vars.get('pillar_vars', {}) %}
+
+{%- set bucket_region = pillar_vars.get('bucket_region', grains_bucket_region) %}
+{%- set bucket_prefix = pillar_vars.get('bucket_prefix', 'evbg-' + salt['grains.get']('environment') + '-' + bucket_region + '-') %}
+{%- set bucket_dict = pillar_vars.get('bucket_dict', {'Notification' : 'notification-uploads','SSP' : 'ssp-uploads','RecipientApp' : 'recipient-uploads','Greetings' : 'notification-greetings','ShapeFiles' : 'tilestache-shapefiles','IVRResources' : 'ivr-resources',
+'RTFImage' : 'email-rtf-img'}) %}
+{%- set amazon_rtfImageBucket = bucket_prefix + bucket_dict.get('RTFImage', 'email-rtf-img') %}
+
+{%- set k8s_stack = salt['pillar.get']('k8s_stack', 'eks1') -%}
+{%- set k8s_tf_state = salt['pillar.get']('tf_state:' + k8s_stack, {}) -%}
+{%- set k8s_ingress_hostname_int = k8s_tf_state.get('nginx_ingress_hostname_int', '') -%}
+
+{%- set cqs_api_url = pillar_vars.get('cams.host.name', {}) %}
+{%- set k8s_stack = salt['pillar.get']('k8s_stack', 'eks1') -%}
+{%- set k8s_tf_state = salt['pillar.get']('tf_state:' + k8s_stack, {}) -%}
+{%- set k8s_ingress_hostname_int = k8s_tf_state.get('nginx_ingress_hostname_int', '') -%}
+
+server {
+    listen       7777;
+    server_name  {{ vars.get('nginx.server_name', 'manager.everbridge.net') }};
+    proxy_connect_timeout   1800;
+    proxy_send_timeout      1800;
+    proxy_read_timeout      1800;
+    proxy_buffering on;
+    send_timeout 1800;
+    rewrite_log on;
+    error_log /var/log/nginx/rewrite.log notice;
+    #proxy_cache_path /usr/local/nginx/proxy
+    real_ip_header X-Forwarded-For;
+    set_real_ip_from 0.0.0.0/0;
+
+    ## Following directive should be inherited by all
+    ## location contexts
+
+     add_header Content-Security-Policy "frame-ancestors 'self' https://{{ vars.get('vcc.host', 'vcc') }}.everbridge.net";
+
+
+    if ($request_method !~ ^(GET|HEAD|POST|PUT|PATCH|DELETE) )
+    {
+        return 444;
+    }
+
+    ##
+    gzip_types text/plain text/css application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript application/javascript;
+
+    location = / {
+
+
+        ##- Changes started -##
+        ## Manager APP SSO ##
+        set $mobile_flag 0;
+        if ($http_user_agent ~* (Android|iPhone|blackberry)) {
+                set $mobile_flag 1;
+        }
+        if ($cookie_eb.user.site.type ~* "MOBILE_WEB") {
+                set $mobile_flag 1;
+        }
+
+        if ($http_user_agent ~* "ManagerSSO") {
+                set $mobile_flag 0;
+        }
+        if ($mobile_flag = 1) {
+                rewrite     ^(.*)$     /m/switcher?type=MOBILE_WEB;
+        }
+
+        ##- Changes End -##
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        ### Most PHP, Python, Rails, Java App can use this header ###
+        proxy_set_header X-Forwarded-Proto https;
+        ### By default we don't want to 0 it ####
+        proxy_redirect     off;
+        ### PROXY PASS TO THE AWS INTERNAL APP LOADBALANCER ###
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location / {
+        rewrite ^/dualLogin http://www.everbridge.com/customer-login/ redirect;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        ### Most PHP, Python, Rails, Java App can use this header ###
+        proxy_set_header X-Forwarded-Proto https;
+
+        ### Add sameSite for cookies
+        ## Removing as part of 9.3 EU issues
+        #proxy_cookie_path / '/;SameSite=Lax';
+
+        ### By default we don't want to redirect it ####
+        proxy_redirect     off;
+
+        ### PROXY PASS TO THE AWS INTERNAL APP LOADBALANCER ###
+        proxy_pass http://127.0.0.1:8080;
+
+    }
+
+    location /websocket/ {
+             proxy_http_version 1.1;
+             proxy_set_header Upgrade $http_upgrade;
+             proxy_set_header Connection "upgrade";
+             proxy_set_header X-Real-IP $remote_addr;
+             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+             proxy_set_header Host $http_host;
+             proxy_redirect     off;
+             proxy_redirect off;
+             proxy_pass http://127.0.0.1:8080;
+    }
+
+
+    location ^~ /twilio/ {
+        resolver 10.67.1.242;
+        #add_header Cache-Control 'no-store';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        ### Most PHP, Python, Rails, Java App can use this header ###
+        proxy_set_header X-Forwarded-Proto https;
+
+        ### By default we don't want to redirect it ####
+        proxy_redirect     off;
+
+        if ($request_uri ~ /twilio/callback/([^/]+)(/.*)?$)
+        {
+            set $twilio_port 8080;
+            set $twilio_host "$1:$twilio_port";
+            set $params $2;
+        }
+        proxy_pass http://$twilio_host;
+    }
+
+    location /sessions/ {
+        deny all;
+    }
+
+    location /nginx_status {
+       # Turn on nginx stats
+       stub_status on;
+       # I do not need logs for stats
+       access_log   off;
+       # Security: Only allow access from localhost #
+       allow 127.0.0.1;
+       # Send rest of the world to /dev/null #
+       deny all;
+    }
+
+    #includes Response Subscriptions(2-way integration)
+    location /statics/ {
+        root /opt/static/fe-manager-portal;
+        if_modified_since off;
+    }
+
+    location /statics/asset-manifest.js {
+        root /opt/static/fe-manager-portal/;
+        add_header Cache-Control 'no-store';
+        add_header Last-Modified "";
+        expires off;
+    }
+
+
+    {% if cqs_api_url|length %}
+    #new asset ui
+    location /statics/asset/v2 {
+        proxy_redirect off;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_pass {{cqs_api_url}};
+    }
+
+    #new asset api
+    location /rest/asset-management {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+
+        ### Most PHP, Python, Rails, Java App can use this header ###
+        proxy_set_header X-Forwarded-Proto https;
+
+        ### By default we don't want to redirect it ####
+        proxy_redirect     off;
+
+        ### LOADBALANCING IS DONE BY NGINX AMONG SERVER SPECIFIED IN UPSTREAM ###
+
+        proxy_pass {{cqs_api_url}};
+    }   
+    #
+    {% endif %}
+
+    #ebsuite-onlinehelp
+    location  /statics/ebsuite-onlinehelp/ {
+            alias /opt/static/ebsuite-onlinehelp/;
+            if_modified_since off;
+
+    }
+    location /statics/ebsuite-onlinehelp/onlineHelp.js {
+            alias /opt/static/ebsuite-onlinehelp/onlineHelp.js;
+            add_header Cache-Control 'no-store';
+            add_header Last-Modified "";
+            expires off;
+    }
+
+    # # For the scheduling static resources, it still reads from previous location.
+    # location /statics/javascripts/views/scheduling {
+    #     root /usr/share/nginx/www;
+    # }
+    #
+    # # For emailsIngestion static resources, it still reads from previous location.
+    # location /statics/javascripts/views/settings/emailIngestion {
+    #     root /usr/share/nginx/www;
+    # }
+
+    location /fmp_incidents_container/ {
+        alias /opt/static/incident_live_chat/;
+        add_header Cache-Control 'public, max-age=31536000';
+        add_header X-Frame-Options SAMEORIGIN;
+    }
+
+    location /fmp_incidents_container/managerLiveChat.html {
+        alias /opt/static/incident_live_chat/managerLiveChat.html;
+        ### Disable the cache ###
+        add_header Last-Modified $date_gmt;
+        add_header Cache-Control 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0';
+        add_header X-Frame-Options SAMEORIGIN;
+        if_modified_since off;
+        expires off;
+        etag off;
+    }
+
+    location ~ ^/(static_.*)(manifest.json|version|version.js|version.txt)$ {
+        alias /opt/static/$1$2;
+        add_header Cache-Control 'public, max-age=120';
+    }
+
+    location ~ ^/public/.*(manifest.json|version|version.js)$ {
+        root /opt/static/fe-manager-portal-react;
+        add_header Cache-Control 'public, max-age=120';
+    }
+
+    # Shared project static files (ipaas/ita/etc)
+    location ~ /static_([^/]*)/(.*)$ {
+        alias /opt/static/static_$1/$2;
+        add_header Cache-Control 'public, max-age=3600';
+    }
+
+    location /public/index.html {
+        root /opt/static/fe-manager-portal-react;
+        add_header Cache-Control 'public, max-age=120';
+        add_header X-Frame-Options SAMEORIGIN;
+    }
+
+    location /public/ {
+        root /opt/static/fe-manager-portal-react;
+        add_header Cache-Control 'public, max-age=3600';
+        add_header X-Frame-Options SAMEORIGIN;
+    }
+
+    location ~ ^/(react)(/.*)?$ {
+        rewrite ^(.*)$ /public/index.html last;
+    }
+
+    location ~ ^/(signIn|forgotPassword|forgotUserName|unlockUser)(/.*)?$ {
+        rewrite ^(.*)$ /public/authentication.html last;
+    }
+
+    {%- if salt['grains.get']('envtype') == 'dev' %}
+        location /storybook/ {
+            root /opt/static/fe-manager-portal-react/public;
+            add_header Cache-Control 'public, max-age=120';
+            add_header X-Frame-Options SAMEORIGIN;
+        }
+    {%- endif %}
+
+    location ^~ /proxy_rtf_image/ {
+         proxy_redirect     off;
+         proxy_pass https://{{ amazon_rtfImageBucket }}.s3.amazonaws.com/;
+    }
+    location ^~ /static_cm/ {
+         proxy_pass http://{{ k8s_ingress_hostname_int }}/static_cm_mgr/;
+         if ($request_uri ~ /(cm-dashboard-manifest|cm-setting-manifest).json$) {
+             add_header Cache-control 'no-store, no-cache';
+         }
+         add_header Cache-Control 'public, max-age=3600';
+    }
+}

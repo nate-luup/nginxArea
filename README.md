@@ -18,3 +18,4 @@
 - [Nginx实战（共十一章）总述&汇总](https://blog.csdn.net/ouyida3/article/details/86771967)
 - [Nginx开发从入门到精通](http://tengine.taobao.org/book/index.html)
 - [HTTPS证书生成原理和部署细节](https://www.barretlee.com/blog/2015/10/05/how-to-build-a-https-server/)
+- [Nginx的location匹配规则](https://www.cnblogs.com/duhuo/p/8323812.html)
